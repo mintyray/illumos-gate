@@ -114,7 +114,7 @@ CPPINCS	=	-I$(PORT_DIR) \
 		-I$(SRC)/stand/lib/sa \
 		-I$(ROOT)/usr/include # Must be last
 
-CPPFLAGS	= $(CPPDEFS) $(CPPINCS) $(STAND_CPPFLAGS)
+CPPFLAGS	= $(CPPDEFS) $(CPPINCS) $(STAND_CPPFLAGS) $(STAND_FLAGS_$(CLASS))
 AS_CPPFLAGS	= -D_ASM $(CPPDEFS) $(CPPINCS) $(STAND_CPPFLAGS) -I.
 
 LIBNFS_LIBS     = libnfs.a libxdr.a libsock.a libinet.a libtcp.a libfdt.a libhsfs.a libufs.a libzfs.a libsa.a
