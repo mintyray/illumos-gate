@@ -20,7 +20,7 @@
  */
 /*
  * Copyright (c) 2007, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright 2018 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright 2020 Tintri by DDN, Inc. All rights reserved.
  */
 
 #include <sys/types.h>
@@ -35,6 +35,8 @@
 #include <sys/nbmlock.h>
 #include <sys/share.h>
 #include <sys/fcntl.h>
+#include <sys/priv_const.h>
+#include <sys/policy.h>
 #include <nfs/lm.h>
 
 #include <smbsrv/smb_kproto.h>
@@ -129,6 +131,7 @@ static smb_wchar_t smb_catia_v4_lookup[SMB_CATIA_V4_LOOKUP_MAX];
 
 static void smb_vop_setup_xvattr(smb_attr_t *smb_attr, xvattr_t *xvattr);
 static void smb_sa_to_va_mask(uint_t sa_mask, uint_t *va_maskp);
+static void smb_sa_to_va_mask_get(uint_t sa_mask, uint_t *va_maskp);
 static callb_cpr_t *smb_lock_frlock_callback(flk_cb_when_t, void *);
 static void smb_vop_catia_init();
 
@@ -324,7 +327,6 @@ smb_vop_getattr(vnode_t *vp, vnode_t *unnamed_vp, smb_attr_t *ret_attr,
 {
 	int error;
 	vnode_t *use_vp;
-	smb_attr_t tmp_attr;
 	xvattr_t tmp_xvattr;
 	xoptattr_t *xoap = NULL;
 
@@ -338,7 +340,7 @@ smb_vop_getattr(vnode_t *vp, vnode_t *unnamed_vp, smb_attr_t *ret_attr,
 		xoap = xva_getxoptattr(&tmp_xvattr);
 		ASSERT(xoap);
 
-		smb_sa_to_va_mask(ret_attr->sa_mask,
+		smb_sa_to_va_mask_get(ret_attr->sa_mask,
 		    &tmp_xvattr.xva_vattr.va_mask);
 
 		XVA_SET_REQ(&tmp_xvattr, XAT_READONLY);
@@ -407,7 +409,7 @@ smb_vop_getattr(vnode_t *vp, vnode_t *unnamed_vp, smb_attr_t *ret_attr,
 		/*
 		 * Support for file systems without VFSFT_XVATTR
 		 */
-		smb_sa_to_va_mask(ret_attr->sa_mask,
+		smb_sa_to_va_mask_get(ret_attr->sa_mask,
 		    &ret_attr->sa_vattr.va_mask);
 
 		error = VOP_GETATTR(use_vp, &ret_attr->sa_vattr,
@@ -420,9 +422,15 @@ smb_vop_getattr(vnode_t *vp, vnode_t *unnamed_vp, smb_attr_t *ret_attr,
 	}
 
 	if (unnamed_vp) {
+		/*
+		 * vp is a named stream under "unnamed_vp"
+		 * Need to get the size from vp (not use_vp)
+		 */
+		smb_attr_t tmp_attr;
 		ret_attr->sa_vattr.va_type = VREG;
 
-		if (ret_attr->sa_mask & (SMB_AT_SIZE | SMB_AT_NBLOCKS)) {
+		if (ret_attr->sa_mask &
+		    (SMB_AT_SIZE | SMB_AT_NBLOCKS | SMB_AT_ALLOCSZ)) {
 			tmp_attr.sa_vattr.va_mask = AT_SIZE | AT_NBLOCKS;
 
 			error = VOP_GETATTR(vp, &tmp_attr.sa_vattr,
@@ -436,8 +444,38 @@ smb_vop_getattr(vnode_t *vp, vnode_t *unnamed_vp, smb_attr_t *ret_attr,
 		}
 	}
 
-	if (ret_attr->sa_vattr.va_type == VDIR)
+	/*
+	 * Override a few things so they're as SMB expects.
+	 * SMB allocsz is always zero for directories.
+	 * For plain files, allocsz is the larger of:
+	 * size, allocsize  (See smb_node_getattr)
+	 */
+	if (ret_attr->sa_vattr.va_type == VDIR) {
 		ret_attr->sa_dosattr |= FILE_ATTRIBUTE_DIRECTORY;
+		/* SMB expectes directories to have... */
+		ret_attr->sa_vattr.va_nlink = 1;
+		ret_attr->sa_vattr.va_size = 0;
+		ret_attr->sa_allocsz = 0;
+	} else {
+		if (ret_attr->sa_dosattr == 0)
+			ret_attr->sa_dosattr = FILE_ATTRIBUTE_NORMAL;
+		if ((ret_attr->sa_mask & SMB_AT_ALLOCSZ) != 0) {
+			/*
+			 * ZFS includes meta-data in va_nblocks.
+			 * Special case zero to keep tests happy.
+			 */
+			if (ret_attr->sa_vattr.va_size == 0 &&
+			    ret_attr->sa_vattr.va_nblocks == 1)
+				ret_attr->sa_allocsz = 0;
+			else
+				ret_attr->sa_allocsz =
+				    ret_attr->sa_vattr.va_nblocks * DEV_BSIZE;
+			if (ret_attr->sa_allocsz < ret_attr->sa_vattr.va_size) {
+				ret_attr->sa_allocsz = P2ROUNDUP(
+				    ret_attr->sa_vattr.va_size, DEV_BSIZE);
+			}
+		}
+	}
 
 	return (error);
 }
@@ -654,6 +692,17 @@ smb_vop_lookup(
 	if (flags & SMB_CATIA)
 		np = smb_vop_catia_v5tov4(name, namebuf, sizeof (namebuf));
 
+#ifdef _KERNEL
+	/*
+	 * The SMB server enables BYPASS_TRAVERSE_CHECKING by default.
+	 * This grants PRIV_FILE_DAC_SEARCH to all users.
+	 * If the user has this privilege, we'll always succeed ACE_EXECUTE
+	 * checks on directories, so skip the (potentially expensive)
+	 * ACL check.
+	 */
+	if (PRIV_POLICY_ONLY(cr, PRIV_FILE_DAC_SEARCH, B_FALSE))
+		option_flags |= ATTR_NOACLCHECK;
+#endif
 	pn_alloc(&rpn);
 
 	/*
@@ -1082,6 +1131,21 @@ smb_sa_to_va_mask(uint_t sa_mask, uint_t *va_maskp)
 			*(va_maskp) |= smb_attrmap[i];
 
 		smask >>= 1;
+	}
+}
+
+/*
+ * Variant of smb_sa_to_va_mask for vop_getattr,
+ * adding some bits for SMB_AT_ALLOCSZ etc.
+ */
+void
+smb_sa_to_va_mask_get(uint_t sa_mask, uint_t *va_maskp)
+{
+	smb_sa_to_va_mask(sa_mask, va_maskp);
+
+	*va_maskp |= AT_TYPE;
+	if ((sa_mask & SMB_AT_ALLOCSZ) != 0) {
+		*va_maskp |= (AT_SIZE | AT_NBLOCKS);
 	}
 }
 
