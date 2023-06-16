@@ -92,8 +92,11 @@ static door_handle_t	dls_mgmt_dh = NULL;
  * If the link is marked as initializing or condemned then it should
  * not be visible outside of the DLS framework.
  */
-#define	DD_NOT_VISIBLE(flags)	(					\
+/*#define	DD_NOT_VISIBLE(flags)	(					\
 	(flags & (DD_CONDEMNED | DD_INITIALIZING)) != 0)
+*/
+#define	DD_NOT_VISIBLE(flags)	(					\
+	(flags & DD_CONDEMNED) != 0)
 
 /*
  * This structure is used to keep the <linkid, macname> mapping.
@@ -318,8 +321,11 @@ i_dls_mgmt_upcall(void *arg, size_t asize, void *rbuf, size_t rsize)
 retry:
 	mutex_enter(&i_dls_mgmt_lock);
 	dh = dls_mgmt_dh;
+//	if (dh == NULL) 
+//		cmn_err(CE_WARN,"i_dls_mgmt_upcall() dlmgmtd not started !");
 	if ((dh == NULL) || i_dls_mgmt_door_revoked(dh)) {
 		mutex_exit(&i_dls_mgmt_lock);
+//		cmn_err(CE_WARN,"i_dls_mgmt_upcall() EBADF");
 		return (EBADF);
 	}
 	door_ki_hold(dh);
@@ -422,11 +428,12 @@ dls_mgmt_create(const char *devname, dev_t dev, datalink_class_t class,
 	if (strlcpy(create.ld_devname, devname, sizeof (create.ld_devname)) >=
 	    sizeof (create.ld_devname))
 		return (EINVAL);
-
+//	cmn_err(CE_WARN,"dls_mgmt_create(%s) dls_upcall()", devname);
 	if ((err = i_dls_mgmt_upcall(&create, sizeof (create), &retval,
 	    sizeof (retval))) == 0) {
 		*linkidp = retval.lr_linkid;
 	}
+//	cmn_err(CE_WARN,"dls_mgmt_create(%s) err=%d",devname, err);
 	return (err);
 }
 
@@ -565,8 +572,10 @@ dls_mgmt_get_next(datalink_id_t linkid, datalink_class_t class,
 	getnext.ld_flags = flags;
 	getnext.ld_linkid = linkid;
 
+//	cmn_err(CE_WARN,"dls_mgmt_get_next()");
 	if (i_dls_mgmt_upcall(&getnext, sizeof (getnext), &retval,
 	    sizeof (retval)) != 0) {
+//		cmn_err(CE_WARN,"dls_mgmt_get_next() returning INVALID_LINKID");
 		return (DATALINK_INVALID_LINKID);
 	}
 
@@ -1238,6 +1247,7 @@ dls_devnet_hold_by_dev(dev_t dev, dls_dl_handle_t *ddhp)
 	    (mod_hash_key_t)name, (mod_hash_val_t *)&ddp)) != 0) {
 		ASSERT(err == MH_ERR_NOTFOUND);
 		rw_exit(&i_dls_devnet_lock);
+		cmn_err(CE_WARN,"mod_hash_find error");
 		return (ENOENT);
 	}
 	mutex_enter(&ddp->dd_mutex);
@@ -1245,6 +1255,7 @@ dls_devnet_hold_by_dev(dev_t dev, dls_dl_handle_t *ddhp)
 	if (DD_NOT_VISIBLE(ddp->dd_flags)) {
 		mutex_exit(&ddp->dd_mutex);
 		rw_exit(&i_dls_devnet_lock);
+//		cmn_err(CE_WARN,"DD not visible  error %x", ddp->dd_flags);
 		return (ENOENT);
 	}
 	ddp->dd_ref++;
@@ -1780,6 +1791,7 @@ dls_devnet_create(mac_handle_t mh, datalink_id_t linkid, zoneid_t zoneid)
 	int		err;
 	mac_perim_handle_t mph;
 
+//	cmn_err(CE_WARN,"dls_devnet_create()");
 	/*
 	 * Holding the mac perimeter ensures that the downcall from the
 	 * dlmgmt daemon which does the property loading does not proceed
@@ -1810,6 +1822,7 @@ dls_devnet_create(mac_handle_t mh, datalink_id_t linkid, zoneid_t zoneid)
 		 * eventually obtain a linkid and call
 		 * dls_devnet_recreate() to complete initialization.
 		 */
+//		cmn_err(CE_WARN,"dls_devnet_create() - check link valid");
 		mutex_enter(&ddp->dd_mutex);
 		if (ddp->dd_linkid != DATALINK_INVALID_LINKID)
 			ddp->dd_flags &= ~DD_INITIALIZING;
